@@ -12,6 +12,13 @@ env:
   CONFIG_FILE: .config
   DIY_P1_SH: diy-part1.sh
   DIY_P2_SH: diy-part2.sh
+  # 第三阶段：安装第三方 feeds 之后执行，用于预装 Open-Box（预编译运行时，非源码包）
+  DIY_P3_SH: diy-part3.sh
+  # Open-Box 预置参数（见 diy-part3.sh 顶部说明）
+  OPENBOX_VERSION: v0.1.236
+  OPENBOX_ARCH: x64
+  OPENBOX_PANEL_PORT: 3036
+  OPENBOX_MIRRORS: https://gh-proxy.com/ https://ghfast.top/
   # 固件只发布到 Release：Release 附件不计入 Actions storage 配额。
   # 原 upload-artifact 步骤已移除（私有仓库仅 500 MB 配额，单个固件包约 1.1 GB）。
   UPLOAD_FIRMWARE: true
@@ -102,6 +109,16 @@ jobs:
         chmod +x $DIY_P2_SH
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    - name: Preinstall Open-Box
+      # 在 feeds install 之后、make defconfig 之前执行。
+      # Open-Box 以预编译 tar.gz 分发（无 Makefile、无法 feeds install），
+      # 这里下载并按官方 installer 的路径落进 openwrt/files/ 覆盖层，
+      # 由 OpenWrt 打包进 rootfs，刷机后开箱即用。
+      run: |
+        chmod +x $DIY_P3_SH
+        cd openwrt
+        $GITHUB_WORKSPACE/$DIY_P3_SH
 
     - name: Download package
       id: package
