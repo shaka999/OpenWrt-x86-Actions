@@ -191,11 +191,57 @@ else
 	echo "[zh] SKIP luci-app-openclash 未启用（已从 .config 移除），无需处理"
 fi
 echo "[zh] $( [ -d "$_onliner/po/zh_Hans" ] && echo 'OK  ' || echo 'WARN') luci-app-onliner po/zh_Hans"
-# luci-app-adguardhome 已从 .config 移除（同 openclash），find 不到属正常，输出 SKIP。
+# luci-app-adguardhome 已重新启用（.config 里三行已取消注释）。
+# _agh 由上面第 73 行统一 find，这里只做自检。
 if [ -n "$_agh" ]; then
-	echo "[zh] $( [ -f "$_agh/po/zh_Hans/adguardhome.po" ] && echo 'OK  ' || echo 'WARN') luci-app-adguardhome po/zh_Hans/adguardhome.po"
+	echo "[zh] $( [ -f "$_agh/po/zh_Hans/adguardhome.po" ] && echo 'OK  ' || echo 'FAIL') luci-app-adguardhome po/zh_Hans/adguardhome.po"
 else
-	echo "[zh] SKIP luci-app-adguardhome 未启用（已从 .config 移除），无需处理"
+	echo "[zh] SKIP luci-app-adguardhome 未找到（feeds install 是否成功？）"
 fi
+
+# ---------- AdGuard Home 接入配置自检 ----------
+# 出厂配置由本仓库 files/ 覆盖层提供：
+#   files/etc/adguardhome/adguardhome.yaml   DNS 监听 5353，上游 127.0.0.1:7853
+#   files/etc/config/adguardhome             enabled=1
+#   files/etc/uci-defaults/97-adguardhome-chain  把 dnsmasq 上游改到 5353
+# 这里只做校验，确认三份文件都被正确打包进覆盖层。
+if [ -f files/etc/adguardhome/adguardhome.yaml ]; then
+	if grep -qE '^\s+port: 5353$' files/etc/adguardhome/adguardhome.yaml; then
+		echo "[agh] OK   adguardhome.yaml dns.port=5353"
+	else
+		echo "[agh] FAIL adguardhome.yaml 的 dns.port 不是 5353 —— 会与 dnsmasq 抢 53"
+	fi
+	if grep -qE '^\s+- 127\.0\.0\.1:7853$' files/etc/adguardhome/adguardhome.yaml; then
+		echo "[agh] OK   upstream_dns=127.0.0.1:7853（指向 Open-Box / sing-box）"
+	else
+		echo "[agh] WARN upstream_dns 未指向 sing-box 的 7853，请人工确认"
+	fi
+	# 用 -F 固定字符串：bcrypt 哈希形如 $2b$10$...，正则里 $ 是行尾锚点，会漏判
+	if grep -qF 'password: $2b$' files/etc/adguardhome/adguardhome.yaml; then
+		echo "[agh] OK   admin 密码已预置为 bcrypt 哈希"
+	else
+		echo "[agh] WARN admin 密码不是 bcrypt 哈希，首次登录会走安装向导"
+	fi
+else
+	echo "[agh] FAIL 缺少 files/etc/adguardhome/adguardhome.yaml"
+fi
+
+if [ -f files/etc/config/adguardhome ] && grep -q "option enabled '1'" files/etc/config/adguardhome; then
+	echo "[agh] OK   /etc/config/adguardhome enabled=1"
+else
+	echo "[agh] FAIL /etc/config/adguardhome 未启用或无文件"
+fi
+
+if [ -x files/etc/uci-defaults/97-adguardhome-chain ]; then
+	echo "[agh] OK   uci-defaults/97-adguardhome-chain 可执行"
+else
+	echo "[agh] FAIL uci-defaults/97-adguardhome-chain 缺失或不可执行"
+fi
+
+# 覆盖层里的可执行文件必须带 x 位：git 的 core.fileMode 在 Windows 上不生效，
+# 靠这里统一补。（uci-defaults 由 boot 用 `.` source，严格说不需要 x，
+# 但 99-set-zh-lang 同样补过，保持一致便于人工排查。）
+chmod +x files/etc/uci-defaults/97-adguardhome-chain 2>/dev/null || true
+chmod +x files/etc/uci-defaults/99-set-zh-lang 2>/dev/null || true
 
 chmod +x files/usr/libexec/rpcd/luci.argon_wallpaper 2>/dev/null || true

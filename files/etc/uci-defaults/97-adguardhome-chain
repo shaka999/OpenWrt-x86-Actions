@@ -1,0 +1,79 @@
+#!/bin/sh
+# 把 AdGuard Home 接进 DNS 链路（首启执行一次）
+#
+# 目标链路：
+#   客户端 → dnsmasq:53 → AdGuard Home:5353（过滤 / 查询日志）
+#          → sing-box:7853（分流 / fakeip）→ 外网
+#
+# 关键点：
+#   1) AdGuard Home 默认端口是 53，与 dnsmasq 冲突，出厂配置已下移到 5353
+#      （见 files/etc/adguardhome/adguardhome.yaml 的 dns.port）。
+#   2) Open-Box 的 init（/opt/open-box/openwrt/initd/openbox 的
+#      openbox_apply_takeover）在 dnsMasq 模式下会把 dnsmasq 的 server
+#      强行改回 127.0.0.1#7853。本脚本把它的状态文件写成 plan=none ——
+#      那是 Open-Box 自己的「明确要求一个都不转发」语义，读到就完全不碰
+#      dnsmasq，从而保留 AdGuard 在链路上。
+#   3) 本脚本跑在 uci-defaults 阶段（早于 dnsmasq 服务启动），所以改完
+#      uci 不需要手动重启；只有检测到 dnsmasq 已在运行才补一次 reload。
+
+set -e
+
+AGH_DNS_PORT=5353
+OB_DATA=/opt/open-box/data
+
+# ---------- 1) 启用 AdGuard Home ----------
+# /etc/config/adguardhome 由本仓库的 files/ 覆盖层提供（enabled 已写 1）；
+# 这里再做一遍是为了覆盖「已刷机后从旧版本升级」的场景。
+# 注意不能 `uci set adguardhome.config='config'`：那会把已有段落重设类型，
+# 段落名与类型恰好同名也不该重复 set，直接用 set 改选项即可。
+if ! uci -q get adguardhome.config >/dev/null 2>&1; then
+	uci -q set adguardhome.config='adguardhome'
+fi
+uci -q set adguardhome.config.enabled='1'
+uci -q set adguardhome.config.config_file='/etc/adguardhome/adguardhome.yaml'
+uci -q set adguardhome.config.work_dir='/var/lib/adguardhome'
+uci -q set adguardhome.config.user='adguardhome'
+uci -q set adguardhome.config.group='adguardhome'
+uci -q commit adguardhome
+
+# 注册开机自启（init 脚本 START=19，排在 dnsmasq 之前启动；
+# 首次启动若配置有误会 respawn，不影响 dnsmasq 起来）
+[ -x /etc/init.d/adguardhome ] && /etc/init.d/adguardhome enable 2>/dev/null || true
+
+# 配置文件必须由服务用户可读写（init 脚本会 chown -R，这里提前保证）
+if [ -d /etc/adguardhome ]; then
+	chown -R adguardhome:adguardhome /etc/adguardhome 2>/dev/null || true
+	chmod 700 /etc/adguardhome 2>/dev/null || true
+	chmod 600 /etc/adguardhome/adguardhome.yaml 2>/dev/null || true
+fi
+
+# ---------- 2) 让 Open-Box 不要抢回 dnsmasq ----------
+# 只在 Open-Box 已经部署过（存在 data 目录）时才写，避免凭空造一个空安装。
+if [ -d "$OB_DATA" ]; then
+	mkdir -p "$OB_DATA"
+	cat > "$OB_DATA/dnsmasq-takeover.txt" <<'OBEOF'
+plan=none
+OBEOF
+	echo "[agh] Open-Box 接管状态已置为 plan=none（不碰 dnsmasq）"
+else
+	echo "[agh] 未检测到 Open-Box 安装，跳过 takeover 处理"
+fi
+
+# ---------- 3) dnsmasq 上移到 AdGuard ----------
+# noresolv=1：只认下面这一条，避免 dnsmasq 并行去问 WAN 的 DNS 而绕过过滤
+uci -q delete dhcp.@dnsmasq[0].server
+uci -q add_list dhcp.@dnsmasq[0].server="127.0.0.1#${AGH_DNS_PORT}"
+uci -q set dhcp.@dnsmasq[0].noresolv='1'
+uci -q commit dhcp
+
+# ---------- 4) 自检 ----------
+echo "[agh] dnsmasq 上游 = 127.0.0.1#${AGH_DNS_PORT}（AdGuard Home）"
+echo "[agh] AdGuard Home 上游 = 127.0.0.1:7853（Open-Box / sing-box）"
+
+# dnsmasq 若已在跑（升级场景），补一次 reload 让新上游立刻生效
+if /etc/init.d/dnsmasq running 2>/dev/null; then
+	/etc/init.d/dnsmasq reload >/dev/null 2>&1 || true
+	echo "[agh] 已 reload dnsmasq"
+fi
+
+exit 0

@@ -1,0 +1,13 @@
+config adguardhome 'config'
+	option enabled '1'
+	# All paths must be readable by the configured user
+	option config_file '/etc/adguardhome/adguardhome.yaml'
+	# Where to store persistent data by AdGuard Home
+	option work_dir '/var/lib/adguardhome'
+	option user 'adguardhome'
+	option group 'adguardhome'
+	option verbose '0'
+	# Advanced options. Modify at your own risk.
+	option gc '0'
+	option maxprocs '0'
+	option memlimit '0'

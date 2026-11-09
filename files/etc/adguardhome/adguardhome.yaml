@@ -1,0 +1,111 @@
+# AdGuard Home —— 出厂预置配置（schema v34，对应 adguardhome 0.107.78）
+#
+# 端口规划（本机实测占用情况）：
+#   53   dnsmasq（LAN 入口，不改动）
+#   7853 Open-Box / sing-box 的 DNS 入口（不改动）
+#   5353 AdGuard Home 的 DNS —— 默认端口 53 已被 dnsmasq 占用，故下移到 5353
+#   3000 AdGuard Home 的 Web 管理界面
+#   22 / 80 / 443 / 7891 / 9095 / 2026（Open-Box 面板）均未冲突
+#
+# 上游指向 127.0.0.1:7853（Open-Box 的 sing-box），这样接进链路后：
+#   客户端 → dnsmasq:53 → AdGuard:5353（过滤）→ sing-box:7853（分流/fakeip）→ 外网
+# 若不想要 AdGuard 参与，把 dnsmasq 的 server 改回 127.0.0.1#7853 即可，
+# 本服务不启动也不影响任何现有功能。
+#
+# 密码：bcrypt(cost=10)。明文见 README「AdGuard Home」一节，登录后请立即修改。
+
+http:
+  address: 0.0.0.0:3000
+  session_ttl: 24h
+  pprof:
+    enabled: false
+    port: 6060
+users:
+  - name: admin
+    password: $2b$10$cnOaBwd4vV0VLoZediV99eEjUaY6KhERBZX5g55QyjvvJHT0jXJYi
+
+dns:
+  # 只监听回环：唯一的消费方是同一台机器上的 dnsmasq（127.0.0.1#5353）。
+  # 不绑 0.0.0.0 有两个原因：
+  #   1) 5353 是 mDNS 的标准端口，将来若装 umdns/avahi 会抢端口；
+  #   2) 少一个对 LAN 暴露的面。要让局域网设备直接查 AdGuard，
+  #      把这里改成 LAN 的 IP（如 10.0.0.1）即可。
+  bind_hosts:
+    - 127.0.0.1
+  port: 5353
+  # Open-Box 的 sing-box：同时监听 UDP/TCP 7853，此处走明文 UDP
+  upstream_dns:
+    - 127.0.0.1:7853
+  # 上游全是本地地址，bootstrap 只用于解析上游域名（此处用不到），
+  # 但留两个国内递归避免首次启动时的外网探测拖慢
+  bootstrap_dns:
+    - 223.5.5.5
+    - 119.29.29.29
+  upstream_mode: load_balance
+  upstream_timeout: 3s
+  cache_enabled: true
+  cache_size: 4194304
+  cache_ttl_min: 60
+  cache_optimistic: true
+  cache_optimistic_answer_ttl: 30s
+  cache_optimistic_max_age: 12h
+  ratelimit: 0
+  refuse_any: true
+  enable_dnssec: false
+  # ⚠️ 必须关闭：若指向 dnsmasq:53，而 dnsmasq 的上游又是本服务的 5353，
+  #    PTR 查询会形成 53 → 5353 → 53 的死循环。关掉后私有地址的 PTR
+  #    直接交给上游 sing-box 处理。
+  use_private_ptr_resolvers: false
+  private_networks:
+    - 10.0.0.0/8
+    - 172.16.0.0/12
+    - 192.168.0.0/16
+  edns_client_subnet:
+    enabled: false
+    use_custom: false
+    custom_ip: ""
+
+filtering:
+  filtering_enabled: true
+  protection_enabled: true
+  parental_enabled: false
+  safebrowsing_enabled: false
+  safe_search:
+    enabled: false
+  rewrites: []
+  safe_fs_patterns: []
+  blocked_services:
+    schedule:
+      time_zone: Local
+    ids: []
+
+filters: []
+whitelist_filters: []
+user_rules: []
+
+querylog:
+  enabled: true
+  file_enabled: true
+  interval: 7d
+  size_memory: 1000
+
+statistics:
+  enabled: true
+  interval: 7d
+
+dhcp:
+  enabled: false
+
+tls:
+  enabled: false
+
+log:
+  file: ""
+  max_backups: 0
+  max_size: 100
+  max_age: 3
+  compress: false
+  local_time: false
+  verbose: false
+
+schema_version: 34

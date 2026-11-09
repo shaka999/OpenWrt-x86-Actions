@@ -27,7 +27,13 @@
 
 set -e
 
-OB_VERSION="${OPENBOX_VERSION:-v0.1.236}"
+# OPENBOX_VERSION 支持两种取值：
+#   latest（推荐/默认）—— 构建时在线解析上游最新 release，上游删旧包也不会失效；
+#   v0.1.xxx          —— 锁定具体版本。
+# 注意：上游只保留最近 10 个 release，更旧的 tag 连同资产一起删除（v0.1.236 / v0.1.300
+# / v0.1.330 / v0.1.360 / v0.1.393 实测全部 404）。所以「锁死版本」长期必然失效，
+# 默认值取 latest。
+OB_PIN="${OPENBOX_VERSION:-latest}"
 OB_ARCH="${OPENBOX_ARCH:-x64}"                       # x86_64 -> x64
 OB_ASSET="open-box-linux-${OB_ARCH}.tar.gz"
 OB_PANEL_PORT="${OPENBOX_PANEL_PORT:-3036}"
@@ -41,10 +47,67 @@ OVERLAY="$TOPDIR/files"
 WORK="$(mktemp -d /tmp/openbox.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
 
-echo "===== 预装 Open-Box ${OB_VERSION} (${OB_ARCH}) ====="
+# ---------- 0. 版本解析 ----------
+# 上游发版频率很高（2026-11-04~05 一天内连发 8 个版本）。若解析到的最新 tag 恰好
+# 仍在上传资产，下载会 404，整轮构建白跑 —— 因此额外解析一个「次新版本」作为降级
+# 候选，按顺序尝试。
 
-# ---------- 1. 下载 ----------
-RAW_BASE="https://github.com/${OB_REPO}/releases/download/${OB_VERSION}"
+_resolve_latest() {
+	# 1) 直连：跟随 /releases/latest 的 302，从 url_effective 尾巴取 tag
+	local t
+	t=$(curl -sSL -o /dev/null -m 25 -w '%{url_effective}' \
+		"https://github.com/$OB_REPO/releases/latest" 2>/dev/null \
+		| sed -n 's#.*/releases/tag/##p' | head -n1)
+	# 2) 镜像兜底（gh-proxy 对 /latest 返回 200 空页，解析不出 tag，故必须判空后继续）
+	if [ -z "$t" ]; then
+		for _m in $OB_MIRRORS; do
+			t=$(curl -sSL -o /dev/null -m 25 -w '%{url_effective}' \
+				"${_m}https://github.com/$OB_REPO/releases/latest" 2>/dev/null \
+				| sed -n 's#.*/releases/tag/##p' | head -n1)
+			[ -n "$t" ] && break
+		done
+	fi
+	printf '%s' "$t"
+}
+
+# 枚举全部 tag，按版本号排序（sort -V 正确处理 v0.1.347 < v0.1.347.1 < v0.1.403）
+_resolve_tags_sorted() {
+	git ls-remote --tags --refs "https://github.com/$OB_REPO.git" 2>/dev/null \
+		| sed 's#.*refs/tags/##' | grep -E '^v[0-9]+(\.[0-9]+)+$' | sort -V
+}
+
+OB_CANDIDATES=""
+if [ "$OB_PIN" = "latest" ] || [ "$OB_PIN" = "LATEST" ] || [ -z "$OB_PIN" ]; then
+	_latest="$(_resolve_latest)"
+	_prev=""
+	if [ -n "$_latest" ]; then
+		OB_CANDIDATES="$_latest"
+		_prev="$(_resolve_tags_sorted | tail -n2 | head -n1)"
+		if [ -n "$_prev" ] && [ "$_prev" != "$_latest" ]; then
+			OB_CANDIDATES="$OB_CANDIDATES $_prev"
+		fi
+		echo "  上游最新版本：${_latest}${_prev:+（降级候选 ${_prev}）}"
+	else
+		# 3) 最后兜底：完全不依赖 HTTP 重定向，直接枚举 tag 取最大
+		echo "  [warn] /releases/latest 解析失败，改用 git tag 枚举"
+		OB_CANDIDATES="$(_resolve_tags_sorted | tail -n1)"
+	fi
+else
+	OB_CANDIDATES="$OB_PIN"
+fi
+
+[ -n "$OB_CANDIDATES" ] || { echo "::error::无法确定 Open-Box 版本（直连/镜像/git 均失败）"; exit 1; }
+for _v in $OB_CANDIDATES; do
+	case "$_v" in
+		v[0-9]*) ;;
+		*) echo "::error::版本号格式异常：${_v}"; exit 1 ;;
+	esac
+done
+
+OB_VERSION="$(printf '%s\n' $OB_CANDIDATES | head -n1)"
+echo "===== 预装 Open-Box（候选：${OB_CANDIDATES}）(${OB_ARCH}) ====="
+
+# ---------- 1. 下载（逐候选、逐镜像）----------
 # 先确定可用的镜像前缀：空字符串代表直连
 _try_download() {
 	local url="$1" out="$2" label="$3"
@@ -57,30 +120,44 @@ _try_download() {
 }
 
 _ok=0
-for _m in "" $OB_MIRRORS; do
-	if _try_download "${_m}${RAW_BASE}/${OB_ASSET}" "$WORK/$OB_ASSET" "镜像=${_m:-直连}"; then
-		_ok=1
-		echo "  下载成功（${_m:-直连}）"
-		break
-	fi
-done
-# GitHub 直连域名不通时，回落到 releases 资产镜像路径（gh-proxy 支持 releases 直链）
-if [ "$_ok" -ne 1 ]; then
-	echo "  [warn] 常规路径均失败，改用 releases 镜像路径重试"
-	for _m in "https://gh-proxy.com/" "https://ghfast.top/"; do
-		if curl -fsSL -m 900 --retry 2 --ssl-no-revoke \
-			-o "$WORK/$OB_ASSET" "${_m}https://github.com/${OB_REPO}/releases/download/${OB_VERSION}/${OB_ASSET}"; then
+for _ver in $OB_CANDIDATES; do
+	if [ "$_ok" -eq 1 ]; then break; fi
+	RAW_BASE="https://github.com/${OB_REPO}/releases/download/${_ver}"
+	for _m in "" $OB_MIRRORS; do
+		if _try_download "${_m}${RAW_BASE}/${OB_ASSET}" "$WORK/$OB_ASSET" "[$_ver] 镜像=${_m:-直连}"; then
 			_ok=1
-			echo "  下载成功（releases 镜像 ${_m}）"
+			OB_VERSION="$_ver"
+			echo "  下载成功（$_ver，${_m:-直连}）"
 			break
 		fi
 	done
-fi
+	# GitHub 直连域名不通时，回落到 releases 资产镜像路径（镜像支持 releases 直链）
+	if [ "$_ok" -ne 1 ]; then
+		echo "  [warn] $_ver 常规路径均失败，改用 releases 镜像路径重试"
+		for _m in "https://gh-proxy.com/" "https://ghfast.top/"; do
+			if _try_download "${_m}${RAW_BASE}/${OB_ASSET}" "$WORK/$OB_ASSET" "[$_ver] releases 镜像=${_m}"; then
+				_ok=1
+				OB_VERSION="$_ver"
+				echo "  下载成功（$_ver，releases 镜像 ${_m}）"
+				break
+			fi
+		done
+	fi
+	if [ "$_ok" -eq 0 ]; then
+		echo "  [warn] 版本 ${_ver} 下载失败，尝试下一个候选"
+	fi
+done
 
 if [ "$_ok" -ne 1 ]; then
-	echo "::error::Open-Box 下载失败（版本 ${OB_VERSION}）。"
-	echo "::error::如为网络原因，可在 workflow env 里设置 OPENBOX_MIRRORS 或 OPENBOX_VERSION。"
+	echo "::error::Open-Box 下载失败（候选：${OB_CANDIDATES}）。"
+	echo "::error::如为网络原因，可在 workflow env 里设置 OPENBOX_MIRRORS，或把 OPENBOX_VERSION 固定到某个可用 tag。"
 	exit 1
+fi
+
+# 把实际装进去的版本暴露给后续步骤（workflow 的 Generate release tag 会写进 Release 说明）
+echo "  实际使用版本：${OB_VERSION}"
+if [ -n "${GITHUB_ENV:-}" ]; then
+	echo "OPENBOX_VERSION_RESOLVED=${OB_VERSION}" >> "$GITHUB_ENV"
 fi
 
 ls -lh "$WORK/$OB_ASSET"

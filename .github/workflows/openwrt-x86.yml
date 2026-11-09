@@ -4,10 +4,40 @@ name: OpenWrt-x86 Builder
 on:
   repository_dispatch:
   workflow_dispatch:
+    inputs:
+      force:
+        description: '强制构建（忽略「上游无 x86 相关变化」的判断）'
+        type: boolean
+        default: false
+  schedule:
+    # 每天 UTC 18:00 = 北京时间 02:00 检查上游。
+    # 只做 SHA 比对 + 树 diff（不下载文件内容，约 10 秒），
+    # 确认有 x86 相关变更才启动 2.5 小时的编译。
+    - cron: '0 18 * * *'
+
+# 同一时间只允许一轮，避免定时触发与手动触发撞车抢 runner / 磁盘
+concurrency:
+  group: openwrt-x86-build
+  cancel-in-progress: false
 
 env:
   REPO_URL: https://github.com/immortalwrt/immortalwrt
-  REPO_BRANCH: v25.12.2
+  # 跟随上游【维护分支】而不是 tag。
+  # tag v25.12.2 停在 2026-09-06，之后 148 个提交（内核 6.12.103→112、
+  # OpenSSL 3.5.7→3.5.9、musl regcomp 溢出修复等）全在分支上，tag 永远拿不到。
+  REPO_BRANCH: openwrt-25.12
+  UPSTREAM_TRACK: openwrt-25.12
+  # 上游提交必须「冷却」这么久才构建：上游常连推多个提交（10-14 一天 3 个），
+  # 等它静下来再编，避免编到半路被上游 revert（如 10-27 那次 airoha revert）。
+  COOLDOWN_HOURS: 6
+  # 与 x86_64 无关的路径：命中这些的改动不触发构建。
+  # 用【黑名单】而非白名单 —— 未知的新路径默认算「相关」，宁可多编一次也不漏掉内核修复。
+  # 实测这 148 个提交共 576 个文件，过滤后剩 150 个与 x86 有关。
+  IGNORE_1: '^package/boot/'
+  IGNORE_2: '^package/firmware/'
+  IGNORE_3: '^package/kernel/(mac80211|mt76|ath|rt2|rtl|brcm|qca-ssdk|hostapd|gpio-button-hotplug|button-hotplug)'
+  IGNORE_4: '^package/network/config/wifi-scripts'
+  FORCE_BUILD: ${{ github.event.inputs.force || 'false' }}
   FEEDS_CONF: feeds.conf.default
   CONFIG_FILE: .config
   DIY_P1_SH: diy-part1.sh
@@ -15,7 +45,9 @@ env:
   # 第三阶段：安装第三方 feeds 之后执行，用于预装 Open-Box（预编译运行时，非源码包）
   DIY_P3_SH: diy-part3.sh
   # Open-Box 预置参数（见 diy-part3.sh 顶部说明）
-  OPENBOX_VERSION: v0.1.236
+  # latest = 每次构建在线解析上游最新 release（上游只保留最近 10 个 release，锁旧版本会 404）；
+  # 需要可复现时改成具体 tag，例如 v0.1.403。
+  OPENBOX_VERSION: latest
   OPENBOX_ARCH: x64
   OPENBOX_PANEL_PORT: 3036
   OPENBOX_MIRRORS: https://gh-proxy.com/ https://ghfast.top/
@@ -42,7 +74,140 @@ env:
   REHEARSAL_SEC: 180
 
 jobs:
+  # ============================================================
+  # 上游检查：只在真正有「跟 x86 有关的」变更时才放行编译。
+  # 全部走 git 协议（不消耗 API 配额），只取树对象不取文件内容。
+  # 实测：ls-remote 1.1s；两次 --depth 1 --filter=blob:none fetch 共 6s。
+  # ============================================================
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      should_build: ${{ steps.gate.outputs.should_build }}
+      upstream_sha: ${{ steps.upstream.outputs.sha }}
+      reason: ${{ steps.gate.outputs.reason }}
+    steps:
+    - name: Resolve upstream HEAD
+      id: upstream
+      run: |
+        set -e
+        SHA=$(git ls-remote "$REPO_URL" "refs/heads/$UPSTREAM_TRACK" | cut -f1)
+        [ -n "$SHA" ] || { echo "::error::取不到上游 SHA"; exit 1; }
+        echo "sha=$SHA" >> $GITHUB_OUTPUT
+        echo "上游 $UPSTREAM_TRACK = $SHA"
+
+    - name: Compare with last successful build
+      id: gate
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        set -e
+        SHA="${{ steps.upstream.outputs.sha }}"
+        REPO="${{ github.repository }}"
+
+        # 上次构建记录：build 成功时把 upstream.sha 一起传进 Release。
+        # 逐个查最近 5 个 release 的资产清单，找到带 upstream.sha 的那一个。
+        LAST=""
+        for TAG in $(curl -fsSL -m 30 -H "Authorization: Bearer $GH_TOKEN" \
+                     "https://api.github.com/repos/$REPO/releases?per_page=5" \
+                     | grep -o '"tag_name": *"[^"]*"' | cut -d'"' -f4); do
+          BODY=$(curl -fsSL -m 30 -H "Authorization: Bearer $GH_TOKEN" \
+                 "https://api.github.com/repos/$REPO/releases/tags/$TAG" || true)
+          if echo "$BODY" | grep -q '"name": *"upstream.sha"'; then
+            URL="https://github.com/$REPO/releases/download/$TAG/upstream.sha"
+            LAST=$(curl -fsSL -m 30 "$URL" | head -n1 | tr -d '\r' || true)
+            echo "找到上次构建记录（$TAG）: ${LAST:-<空>}"
+            break
+          fi
+        done
+
+        # ---- 手动/事件触发一律放行 ----
+        if [ "${{ github.event_name }}" != "schedule" ]; then
+          echo "should_build=true" >> $GITHUB_OUTPUT
+          echo "reason=非定时触发（${{ github.event_name }}），直接构建" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        if [ "${FORCE_BUILD}" = "true" ]; then
+          echo "should_build=true" >> $GITHUB_OUTPUT
+          echo "reason=force=true" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # ---- 首次运行：没有上次记录，放行一次 ----
+        if [ -z "$LAST" ]; then
+          echo "should_build=true" >> $GITHUB_OUTPUT
+          echo "reason=无上次构建记录（首次），构建一次建立基线" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # ---- SHA 未变：跳过 ----
+        if [ "$LAST" = "$SHA" ]; then
+          echo "should_build=false" >> $GITHUB_OUTPUT
+          echo "reason=上游 SHA 未变（$SHA），跳过" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # ---- SHA 变了，取两棵树做路径级 diff ----
+        WORK=/tmp/upstream-diff
+        rm -rf "$WORK"; mkdir -p "$WORK"
+        git -C "$WORK" init -q
+        git -C "$WORK" remote add origin "$REPO_URL"
+        # --filter=blob:none：只要树和提交对象，不下载任何文件内容（几 MB）
+        git -C "$WORK" fetch -q --depth 1 --filter=blob:none origin "$LAST"
+        git -C "$WORK" fetch -q --depth 1 --filter=blob:none origin "$SHA"
+        git -C "$WORK" diff --name-only "$LAST" "$SHA" > /tmp/changed.txt || true
+
+        TOTAL=$(wc -l < /tmp/changed.txt)
+        echo "=== 上游 $LAST -> $SHA 共 $TOTAL 个变更文件 ==="
+
+        # 过滤：非 x86 的 target 目录 + WiFi/uboot/固件类包
+        {
+          grep -vE '^target/linux/' /tmp/changed.txt || true
+          grep -E  '^target/linux/(x86|generic)/' /tmp/changed.txt || true
+        } | grep -vE "${IGNORE_1}|${IGNORE_2}|${IGNORE_3}|${IGNORE_4}" \
+          | sort -u > /tmp/relevant.txt || true
+
+        REL=$(wc -l < /tmp/relevant.txt)
+        echo "与 x86_64 相关: $REL 个"
+        if [ "$REL" -gt 0 ]; then
+          echo "--- 相关文件（最多 40 行）---"
+          head -40 /tmp/relevant.txt
+        fi
+
+        # ---- 冷却期：上游最新提交必须已静置 COOLDOWN_HOURS 小时 ----
+        CT=$(git -C "$WORK" log -1 --format=%ct "$SHA")
+        NOW=$(date +%s)
+        AGE_H=$(( (NOW - CT) / 3600 ))
+        echo "上游最新提交距今 ${AGE_H}h（冷却阈值 ${COOLDOWN_HOURS}h）"
+
+        if [ "$REL" -eq 0 ]; then
+          echo "should_build=false" >> $GITHUB_OUTPUT
+          echo "reason=$TOTAL 个变更文件均与 x86 无关，跳过" >> $GITHUB_OUTPUT
+        elif [ "$AGE_H" -lt "$COOLDOWN_HOURS" ]; then
+          echo "should_build=false" >> $GITHUB_OUTPUT
+          echo "reason=有 $REL 个相关变更，但上游仍在活跃提交（${AGE_H}h < ${COOLDOWN_HOURS}h），等下一轮" >> $GITHUB_OUTPUT
+        else
+          echo "should_build=true" >> $GITHUB_OUTPUT
+          echo "reason=有 $REL 个 x86 相关变更，上游已静置 ${AGE_H}h" >> $GITHUB_OUTPUT
+        fi
+
+    - name: Summary
+      run: |
+        {
+          echo "### 上游检查结果"
+          echo ""
+          echo "| 项 | 值 |"
+          echo "|---|---|"
+          echo "| 上游分支 | \`$UPSTREAM_TRACK\` |"
+          echo "| 上游 SHA | \`${{ steps.upstream.outputs.sha }}\` |"
+          echo "| 是否构建 | **${{ steps.gate.outputs.should_build }}** |"
+          echo "| 原因 | ${{ steps.gate.outputs.reason }} |"
+        } >> $GITHUB_STEP_SUMMARY
+
   build:
+    needs: check
+    if: needs.check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -83,7 +248,19 @@ jobs:
       working-directory: /workdir
       run: |
         df -hT $PWD
-        git clone --depth 1 -b $REPO_BRANCH $REPO_URL openwrt
+        # 固定到 check job 解析出的那个 commit，而不是「当时的分支头」。
+        # 两者通常一致，但定时触发到编译开始之间若有新提交，固定 SHA 能保证
+        # 「测了什么就编什么」，也让 upstream.sha 的语义严格成立。
+        PIN="${{ needs.check.outputs.upstream_sha }}"
+        if [ -z "$PIN" ]; then
+          git clone --depth 1 -b "$REPO_BRANCH" "$REPO_URL" openwrt
+        else
+          git init -q openwrt
+          git -C openwrt remote add origin "$REPO_URL"
+          git -C openwrt fetch -q --depth 1 origin "$PIN"
+          git -C openwrt checkout -q FETCH_HEAD
+          echo "已固定到上游 commit: $(git -C openwrt rev-parse HEAD)"
+        fi
         ln -sf /workdir/openwrt $GITHUB_WORKSPACE/openwrt
 
     - name: Load custom feeds
@@ -109,6 +286,35 @@ jobs:
         chmod +x $DIY_P2_SH
         cd openwrt
         $GITHUB_WORKSPACE/$DIY_P2_SH
+
+    - name: Stamp version string
+      # 跟分支构建时 include/version.mk 的默认值会变成 25.12-SNAPSHOT（无信息量），
+      # 而且 VERSION_CODE 会走 getver.sh；这里显式钉住版本串，让每次构建的固件
+      # 都能从 /etc/openwrt_release 看出「上游哪个 commit」。
+      #
+      # 必须同时开两个开关，缺一不生效：
+      #   CONFIG_IMAGEOPT   — scripts/package-metadata.pl 生成
+      #                        menuconfig IMAGEOPT / default n，
+      #                        image-config.in 里所有 menuconfig 都挂 `if IMAGEOPT`；
+      #   CONFIG_VERSIONOPT — image-config.in 里同样是 menuconfig + default n，
+      #                        VERSION_NUMBER / VERSION_DIST 全在 `if VERSIONOPT` 块内。
+      # 官方 25.12.2 镜像的 config.buildinfo 里这两个都是 =y（已核对），照抄。
+      run: |
+        cd openwrt
+        SHA="${{ needs.check.outputs.upstream_sha }}"
+        SHORT=$(echo "$SHA" | cut -c1-10)
+        VER="25.12-git-${SHORT}"
+        {
+          echo ""
+          echo "# ---- 由 workflow 注入：跟随上游 openwrt-25.12 ----"
+          echo "CONFIG_IMAGEOPT=y"
+          echo "CONFIG_VERSIONOPT=y"
+          echo "CONFIG_VERSION_NUMBER=\"${VER}\""
+          echo "CONFIG_VERSION_DIST=\"ImmortalWrt\""
+          echo "CONFIG_VERSION_FILENAMES=y"
+        } >> .config
+        echo "版本串: ${VER}"
+        grep -n 'CONFIG_VERSION\|CONFIG_IMAGEOPT' .config || true
 
     - name: Preinstall Open-Box
       # 在 feeds install 之后、make defconfig 之前执行。
@@ -283,7 +489,27 @@ jobs:
       run: |
         echo "release_tag=$(date +"%Y.%m.%d-%H%M")" >> $GITHUB_OUTPUT
         touch release.txt
+        # 记录本轮实际装进去的 Open-Box 版本（diy-part3.sh 解析后写入 GITHUB_ENV），
+        # 用 latest 时版本会随上游变动，这里留痕便于回溯。
+        if [ -n "${OPENBOX_VERSION_RESOLVED:-}" ]; then
+          echo "Open-Box: ${OPENBOX_VERSION_RESOLVED}" >> release.txt
+        fi
+        # 上游来源留痕：check job 解析出的 commit
+        SHA="${{ needs.check.outputs.upstream_sha }}"
+        if [ -n "$SHA" ]; then
+          echo "ImmortalWrt: ${UPSTREAM_TRACK} @ ${SHA}" >> release.txt
+        fi
         echo "status=success" >> $GITHUB_OUTPUT
+
+    - name: Write upstream marker
+      # 下一轮 check 靠这个文件判断「上次编到哪个 commit」。
+      # 必须放在 Upload 之前，且文件名固定为 upstream.sha。
+      if: env.UPLOAD_RELEASE == 'true' && success()
+      run: |
+        SHA="${{ needs.check.outputs.upstream_sha }}"
+        [ -n "$SHA" ] || { echo "::error::缺少 upstream_sha"; exit 1; }
+        echo "$SHA" > "$GITHUB_WORKSPACE/upstream.sha"
+        echo "写入 upstream.sha: $SHA"
 
     - name: Upload firmware to release
       uses: softprops/action-gh-release@master
@@ -293,7 +519,9 @@ jobs:
       with:
         tag_name: ${{ steps.tag.outputs.release_tag }}
         body_path: release.txt
-        files: ${{ env.FIRMWARE }}/*
+        files: |
+          ${{ env.FIRMWARE }}/*
+          ${{ github.workspace }}/upstream.sha
 
     - name: Delete workflow runs
       # 用 !cancelled() 而非 success()：失败的 run 同样要清理。

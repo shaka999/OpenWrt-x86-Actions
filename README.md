@@ -42,7 +42,64 @@
 | 第三方 feed | `lucky`、`istore`、`bandix` + `bandixcore`、`partexp`（见 `diy-part1.sh`） |
 | 额外引入 | `luci-app-onliner`（xuanranran fork，含中文） |
 
-### Open-Box（编译期预装）
+### 上游跟随策略（2026-11 起）
+
+#### 为什么跟分支而不跟 tag
+
+`v25.12.2` 是**标签**，停在 2026-09-06；之后上游 `openwrt-25.12` **维护分支**已前进 148 个提交
+（内核 6.12.103→112、OpenSSL 3.5.7→3.5.9、musl regcomp 溢出修复、dnsmasq 大 hosts 重载优化等），
+钉 tag 永远拿不到这些修复。上游也没有 v25.12.3/4/5 的 ImmortalWrt 自有 tag
+（官方 OpenWrt 有 v25.12.3~6，ImmortalWrt 是直接把官方改动 merge 进分支）。
+
+所以 `REPO_BRANCH` 指向 `openwrt-25.12`。
+
+#### 三道闸门，避免「白烧 2.5 小时」
+
+| 闸门 | 机制 | 实测 |
+|---|---|---|
+| ① SHA 比对 | 读取上次 Release 里的 `upstream.sha`，与 `git ls-remote` 的当前头比对 | `ls-remote` 1.1s |
+| ② 路径过滤 | 两次 `--filter=blob:none` 浅 fetch 后 `git diff --name-only`，剔除 arm 板 target 与 WiFi/uboot/固件包 | 576 文件 → 150 相关 |
+| ③ 冷却期 | 上游最新提交须静置 `COOLDOWN_HOURS`（默认 6h） | 防止编到半路被 revert |
+
+只用 git 协议，**不消耗 API 配额**（`ls-remote` 与 `fetch` 都走 443 git 通道）。
+三道全过才启动编译，单次约 114~157 分钟。
+
+过滤用**黑名单**（fail-open）：未知新路径默认算「相关」，宁可多编一次也不漏掉内核修复。
+
+#### 版本串固定（必做）
+
+分支头的 `include/version.mk` 默认值是 `25.12-SNAPSHOT`，`VERSION_CODE` 走 `getver.sh`。
+浅克隆下 `getver.sh` 只能算出 `r0-3682a14`（因为分支把 `version` 文件删了，且 `--depth 1`
+没有历史可数），版本串因此毫无信息量。
+
+workflow 的 `Stamp version string` 步骤注入：
+
+```
+CONFIG_IMAGEOPT=y
+CONFIG_VERSIONOPT=y
+CONFIG_VERSION_NUMBER="25.12-git-<上游sha前十位>"
+CONFIG_VERSION_DIST="ImmortalWrt"
+CONFIG_VERSION_FILENAMES=y
+```
+
+**`CONFIG_IMAGEOPT` 和 `CONFIG_VERSIONOPT` 两个开关缺一不生效**：
+`scripts/package-metadata.pl` 生成 `menuconfig IMAGEOPT / default n`，
+`image-config.in` 里 `menuconfig VERSIONOPT` 也是 `default n` 且整块包在 `if VERSIONOPT` 内。
+官方 25.12.2 镜像的 `config.buildinfo` 里这两个都是 `=y`。
+
+**刻意不设 `CONFIG_VERSION_REPO`**：分支头内核 6.12.112，而 `releases/25.12.2` 源里的 kmod
+是 6.12.103（vermagic `0413601b...` vs `566f115f...`）。钉 25.12.2 会让 opkg 装错 ABI；
+默认的 `25.12-SNAPSHOT` 源内核正是 6.12.112，与本构建一致。
+
+#### 手动触发
+
+`workflow_dispatch` 带 `force` 布尔参数：勾上则忽略闸门 ①②③ 直接编译。
+非定时触发（`workflow_dispatch` / `repository_dispatch`）本来就一律放行。
+
+定时任务与手动触发共用 `concurrency: openwrt-x86-build`，`cancel-in-progress: false`，
+不会互相打断。
+
+## Open-Box（编译期预装）
 
 [Open-Box](https://github.com/liandu2024/Open-Box) 是 OpenWrt 上的一体化透明代理方案，
 自带 sing-box 内核、Node 运行时与完整 GeoSite / GeoIP 数据。
@@ -70,15 +127,20 @@
   首次打开面板时按官方流程设置密码，行为与 `curl | sh` 安装一致。
 - 下载支持**镜像回落**（GitHub 直连失败自动换 gh-proxy / ghfast）。
 - 读取包内 `meta.json` **校验 version 与 arch**，防止上游改包导致静默不一致。
-- 版本通过 workflow 的 `OPENBOX_VERSION` 控制（当前 `v0.1.236`）。
+- 版本默认 `latest`：每次构建在线解析上游最新 release（跟随 `/releases/latest` 的 302，
+  失败回落镜像，再失败用 `git ls-remote --tags` 枚举），并把**次新版本**作为降级候选，
+  避免撞上「刚发版、资产还在传」的窗口。实际装进去的版本会写进 Release 说明。
+  如遇上游版本回归，把 workflow 的 `OPENBOX_VERSION` 改成具体 tag（例如 `v0.1.403`）即可锁定。
+- **上游只保留最近 10 个 release**，更旧的 tag 连同资产一起删除（`v0.1.236`、`v0.1.300`、
+  `v0.1.330`、`v0.1.360`、`v0.1.393` 实测均 404），因此锁死具体版本长期必然失效。
 
 启动顺序经刻意设计：`S98openbox-panel` → `S99openbox`，让内核**等网络完全就绪后再启动**。
 
-### 已选插件（`.config`，**207** 个包）
+### 已选插件（`.config`，**210** 个包）
 
 | 类别 | 内容 |
 |---|---|
-| 代理 / 网络 | `luci-app-lucky`、`luci-app-upnp`、`miniupnpd-nftables` |
+| 代理 / 网络 | `luci-app-lucky`、`luci-app-upnp`、`miniupnpd-nftables`、`adguardhome` + `luci-app-adguardhome`（见下节） |
 | 容器 | `docker` + `dockerd` + `docker-compose` + `luci-app-dockerman` |
 | 存储 | `luci-app-diskman`、`parted`、`resize2fs`、`btrfs-progs`、`f2fs-tools`、`exfat-*` |
 | 文件管理 | `luci-app-filemanager`、`nano`、`vim` |
@@ -91,9 +153,131 @@
 **已移除的插件**（原配置项以注释保留，取消注释即可恢复）：
 
 - `luci-app-openclash`（及自动带入的 `ruby` / `ruby-yaml` / `unzip` / `ca-bundle`）
-- `adguardhome` + `luci-app-adguardhome` + `luci-i18n-adguardhome-zh-cn`
 
-### argon 主题覆盖层（`files/`，16 个文件）
+### AdGuard Home（2026-11 启用并预置配置）
+
+`.config` 三行已恢复启用（207 → **210** 个包）：
+
+```
+CONFIG_PACKAGE_adguardhome=y                      # 本体（0.107.78，pinned feeds）
+CONFIG_PACKAGE_luci-app-adguardhome=y             # LuCI 界面
+CONFIG_PACKAGE_luci-i18n-adguardhome-zh-cn=y      # 中文包（由 diy-part2.sh 注入译本生成）
+```
+
+源码编译，非预编译包：
+
+| 项 | 值 |
+|---|---|
+| 版本 | `0.107.78`（pinned `packages` commit `84bd8638`；分支头已到 0.107.79） |
+| 源码 | `codeload.github.com/AdguardTeam/AdGuardHome/tar.gz/v0.107.78`（实测 200） |
+| frontend | `AdGuardHome_frontend.tar.gz`（实测 200） |
+| `PKG_BUILD_DEPENDS` | `golang/host` |
+| `DEPENDS` | `+ca-bundle`（`ca-bundle` 已因 Open-Box 存在） |
+| 二进制体积 | 约 12 MB（官方 apk 12,366,465 B） |
+
+**⚠️ 首次引入 `golang/host` 工具链，构建时间会明显变长。**
+当前 `.config` 里没有任何 Go 源码编译包（`lucky` 用上游预编译 tarball，`bandix-plus` 是 Rust，
+`docker`/`containerd` 也是预编译），所以 `CONFIG_GOLANG_BUILD_BOOTSTRAP` 取默认 `y`，
+要走**完整四段自举**：
+
+```
+go1.4-bootstrap  →  go1.17.13  →  go1.20.14  →  go1.22.12  →  go1.26.8(host)  →  AdGuardHome
+```
+
+五个 tarball 均已实测可下载（`go.dev/dl/` 全 200）。这段是本轮唯一无法离线验证的部分，
+首次构建若卡住，优先看 `build_dir_host/` 与 `dl/go1.*.src.tar.gz`。
+
+### AdGuard Home 接入方式（**已预置，开箱即用**）
+
+出厂就接进 DNS 链路，**AdGuard Home 当 dnsmasq 的上游**：
+
+```
+客户端 → dnsmasq:53 → AdGuard Home:5353（过滤 / 查询日志）
+       → sing-box:7853（分流 / fakeip）→ 外网
+```
+
+路由器实测基线（2026-11-09，改动前）：
+
+```
+dnsmasq  : 监听所有接口 53；uci server='127.0.0.1#7853'  noresolv='1'
+sing-box : 监听 :::7853（UDP+TCP，Open-Box 的 dns-in inbound）
+5353     : 空闲（umdns 未安装、无 avahi）
+3000     : 空闲
+uid 853  : adguardhome 用户由包脚本创建，与现有无冲突
+```
+
+#### 端口为什么是 5353 而不是 53
+
+53 被 dnsmasq 占着，抢不到会让 procd 反复 respawn。所以 `dns.port` 下移到 **5353**
+（`files/etc/adguardhome/adguardhome.yaml`）。`bind_hosts` 只绑 `127.0.0.1` ——
+唯一消费方是同机的 dnsmasq；不绑 `0.0.0.0` 是为了不和将来的 mDNS（5353 是标准端口）冲突，
+也少一个对 LAN 暴露的面。要让局域网设备直查 AdGuard，把 `bind_hosts` 改成 `10.0.0.1`。
+
+#### 三份覆盖层文件
+
+| 文件 | 作用 |
+|---|---|
+| `files/etc/adguardhome/adguardhome.yaml` | 主配置：`dns.port=5353`、`upstream_dns=127.0.0.1:7853`、`http.address=0.0.0.0:3000`、schema v34 |
+| `files/etc/config/adguardhome` | uci：`enabled='1'`（覆盖上游默认 `0`） |
+| `files/etc/uci-defaults/97-adguardhome-chain` | 首启：enable 服务、`dnsmasq.server=127.0.0.1#5353`、把 Open-Box 接管状态置为 `plan=none` |
+
+#### ⚠️ 和 Open-Box 的冲突（这是唯一的坑）
+
+Open-Box 的 `openbox_apply_takeover()`（`/opt/open-box/openwrt/initd/openbox`）在
+`plan=all` 时会把 `dnsmasq.server` **强制改回** `127.0.0.1#7853`。也就是说刷机后
+若 Open-Box 面板部署过，AdGuard 会被踢出链路。
+
+`97-adguardhome-chain` 的解法是把它自己的状态文件写成：
+
+```
+/opt/open-box/data/dnsmasq-takeover.txt:
+plan=none
+```
+
+`plan=none` 是 Open-Box **自己的语义**（init 第 172-175 行注释：「面板明确要求一个都不转发，
+原 DNS 原样」），读到这个值它就直接 `return 0`，完全不碰 dnsmasq。
+
+**但如果之后在 Open-Box 面板里点「部署」且 DNS 模式是 `dnsmasq`，它会重写这个文件为
+`plan=all` 或 `plan=domains`，AdGuard 就再次被绕过。** 两种处理：
+
+1. 面板里把 DNS 模式改成 `off`（代码里 `dns.mode` 的合法值之一是 `"off"`，
+   此时 `dnsForward='none'`，不接管）；
+2. 或者重新执行一次链路修复：
+   ```sh
+   printf 'plan=none\n' > /opt/open-box/data/dnsmasq-takeover.txt
+   uci delete dhcp.@dnsmasq[0].server
+   uci add_list dhcp.@dnsmasq[0].server='127.0.0.1#5353'
+   uci set dhcp.@dnsmasq[0].noresolv='1'
+   uci commit dhcp && /etc/init.d/dnsmasq restart
+   ```
+
+#### 不能开 `use_private_ptr_resolvers`
+
+若把 PTR 交给 `127.0.0.1:53`（dnsmasq），而 dnsmasq 的上游正是 AdGuard 的 5353，
+私有地址反查会形成 `53 → 5353 → 53` 死循环。配置里显式设为 `false`。
+
+#### 登录
+
+- 地址：`http://10.0.0.1:3000`（LAN zone `input=ACCEPT`，无需额外防火墙规则）
+- 用户名：`admin`
+- 密码：`9DUwEmciHXhfBP`（bcrypt cost=10，已写入 yaml；**登录后请立即改**）
+
+#### 关于 filters 为什么是空的
+
+`filters: []` —— 出厂不带任何订阅列表。首次进面板勾选需要的即可
+（AdGuard 内置推荐列表含 AdGuard DNS filter / OISD 等）。
+空列表 + `filtering_enabled: true` 是合法的，只是暂时没有规则生效。
+
+#### 恢复成「不经过 AdGuard」
+
+```sh
+uci delete dhcp.@dnsmasq[0].server
+uci add_list dhcp.@dnsmasq[0].server='127.0.0.1#7853'
+uci commit dhcp && /etc/init.d/dnsmasq restart
+/etc/init.d/adguardhome stop && /etc/init.d/adguardhome disable
+```
+
+### files/ 覆盖层（18 个文件：主题 15 + AdGuard 3）
 
 ```
 files/etc/config/network                                    676 B
@@ -103,12 +287,15 @@ files/usr/share/ucode/luci/template/themes/argon/*.ut   5 个模板
 files/www/luci-static/argon/css/cascade.css              101551 B   定制样式
 files/www/luci-static/argon/css/dark.css                  23553 B
 files/www/luci-static/argon/icon/*.png/xml               5 个图标
+files/etc/adguardhome/adguardhome.yaml                3131 B   见「AdGuard Home 接入方式」
+files/etc/config/adguardhome                           425 B   enabled='1'
+files/etc/uci-defaults/97-adguardhome-chain           3561 B   首启接 DNS 链路
 ```
 
 > 主题本体（字体 / 图片 / 图标等静态资源）由 feeds 的 `luci-theme-argon` 提供，
 > 覆盖层只保留个性化文件 —— 已确认被移除的 24 个文件与自带版本逐字节相同。
 
-### `diy-part2.sh` 里的两处关键修补
+### `diy-part2.sh` 里的关键修补
 
 **① dockerd 构建修复**
 
@@ -179,13 +366,26 @@ Open-Box 预装  0.19 G
 > 遗留风险：`build_dir` 的 35 G 距 72 G 上限仍有约 9 G 余量，**余量偏紧**。
 > 若后续增加大包，建议改为「分段编译 + 打包前清理中间产物」。
 
+**2026-11 启用 AdGuard Home 后的预估变化**（尚未实测，首次构建后回填）：
+
+| 项 | 变化 | 说明 |
+|---|---|---|
+| `dl` | +约 0.6 G | 5 个 Go 源码 tarball（含 1.4 bootstrap）+ AdGuardHome 源码 + frontend |
+| `build_dir` | +约 3~5 G | `build_dir_host/` 里四段 Go 工具链全量编译产物 |
+| `staging_dir` | +约 0.5 G | host Go 的 bin/pkg/src 装进 `staging_dir_host` |
+| rootfs | +约 12 MB | AdGuardHome 二进制（官方 apk 12,366,465 B） |
+| 构建耗时 | **+30~50 分钟** | Go 自举链是纯串行，且 runner 是多核但 Go 编译阶段并行度有限 |
+
+> ⚠️ `build_dir_host` 的 Go 自举是本轮最大的磁盘与时间不确定项。
+> 若 `MIN_FREE_GB=30` 或 `GUARD_MIN_MB=3072` 触发，先看是不是 Go 这一段吃掉了余量。
+
 ---
 
 ## 文件说明
 
 | 路径 | 用途 |
 |---|---|
-| `.config` | 编译配置（207 个包） |
+| `.config` | 编译配置（210 个包） |
 | `diy-part1.sh` | feeds update **之前**执行：添加第三方 feed、引入 onliner |
 | `diy-part2.sh` | feeds install **之后**执行：dockerd 修复、中文翻译修补 |
 | `diy-part3.sh` | **Open-Box 编译期预装**：下载预编译包并写入 `files/` 覆盖层 |
